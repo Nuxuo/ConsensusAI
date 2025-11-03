@@ -2,318 +2,441 @@ using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
 using ConsensusAI.Models;
 using System.Text.Json;
+using System.Text;
 
 namespace ConsensusAI.Services;
 
 public class StockAnalysisOrchestrator
 {
     private readonly Kernel _kernel;
-    private readonly List<Agent> _agents;
+    private readonly List<Agent> _analysts;
+    private readonly List<Agent> _researchers;
     private readonly ILogger<StockAnalysisOrchestrator> _logger;
+    private readonly IStockDataService _stockDataService;
+    private readonly RiskManager _riskManager;
+    private readonly PortfolioManager _portfolioManager;
 
-    public StockAnalysisOrchestrator(Kernel kernel, ILogger<StockAnalysisOrchestrator> logger)
+    public StockAnalysisOrchestrator(
+        Kernel kernel,
+        ILogger<StockAnalysisOrchestrator> logger,
+        IStockDataService stockDataService)
     {
         _kernel = kernel;
         _logger = logger;
-        _agents = new List<Agent>
+        _stockDataService = stockDataService;
+        _riskManager = new RiskManager();
+        _portfolioManager = new PortfolioManager();
+
+        // Analyst Team - run in parallel
+        _analysts = new List<Agent>
         {
-            new Agent("Bull", "You are an optimistic analyst who looks for growth opportunities and positive signals. Focus on upside potential."),
-            new Agent("Bear", "You are a risk-focused analyst who identifies potential problems and downside risks. Be skeptical and cautious."),
-            new Agent("Technicals", "You are a technical analyst who focuses on price patterns, momentum, and chart signals."),
-            new Agent("Fundamentals", "You are a fundamental analyst who examines financial metrics, valuation, and business quality.")
+            new Agent("Technical_Analyst",
+                "You are a technical analyst. Analyze price trends, momentum indicators (RSI, MACD, moving averages), volume patterns, support/resistance levels, and chart formations. Provide specific entry/exit signals based on technical data.",
+                "Technical"),
+            new Agent("Fundamental_Analyst",
+                "You are a fundamental analyst. Evaluate financial metrics, valuation ratios, earnings quality, growth rates, and business fundamentals. Assess intrinsic value vs market price.",
+                "Fundamental"),
+            new Agent("Sentiment_Analyst",
+                "You are a sentiment analyst. Analyze market sentiment from news, social media, analyst ratings, and investor behavior. Gauge bullish/bearish sentiment and contrarian indicators.",
+                "Sentiment"),
+            new Agent("News_Analyst",
+                "You are a news analyst. Evaluate recent news, earnings reports, analyst upgrades/downgrades, and macroeconomic events. Assess impact on stock price and sector trends.",
+                "News")
+        };
+
+        // Researcher Team - debate structure
+        _researchers = new List<Agent>
+        {
+            new Agent("Bull_Researcher",
+                "You are a bullish researcher. Review analyst reports and build the strongest BULL case. Highlight growth catalysts, undervaluation, competitive advantages, and positive trends. Challenge bearish concerns with data.",
+                "Bull"),
+            new Agent("Bear_Researcher",
+                "You are a bearish researcher. Review analyst reports and build the strongest BEAR case. Identify overvaluation, risks, competitive threats, and negative trends. Challenge bullish assumptions with data.",
+                "Bear")
         };
     }
 
-    public async Task<AnalysisResult> AnalyzeStock(StockRequest request)
+    public async Task<AnalysisResult> AnalyzeStock(
+        StockRequest request,
+        decimal portfolioValue = 100000m,
+        CancellationToken cancellationToken = default)
     {
+        ValidateRequest(request);
+
         var tickers = string.Join(", ", request.Tickers);
-        _logger.LogDebug("Starting {Mode} analysis for {Tickers} with {Rounds} discussion rounds",
-            request.Mode, tickers, request.DiscussionRounds);
+        _logger.LogInformation("Starting {Mode} analysis for {Tickers}", request.Mode, tickers);
 
         var conversation = new List<AgentMessage>();
-        var chatHistory = new ChatHistory();
-
-        var initialPrompt = GetInitialPrompt(request);
-
-        conversation.Add(new AgentMessage("System", initialPrompt, DateTime.UtcNow));
-        chatHistory.AddSystemMessage(initialPrompt);
-
-        _logger.LogDebug("ROUND 1: Initial Analysis");
-
-        // Round 1: Each agent gives their initial analysis
-        foreach (var agent in _agents)
-        {
-            _logger.LogDebug("{Agent} analyzing...", agent.Name);
-
-            var response = await agent.GetResponse(_kernel, tickers, chatHistory, request.Mode);
-
-            _logger.LogDebug("{Agent}: {Response}", agent.Name, response);
-
-            conversation.Add(new AgentMessage(agent.Name, response, DateTime.UtcNow));
-            chatHistory.AddUserMessage($"{agent.Name} says: {response}");
-        }
-
-        // Additional discussion rounds
-        for (int round = 2; round <= request.DiscussionRounds; round++)
-        {
-            _logger.LogDebug("ROUND {Round}: Discussion & Debate", round);
-
-            foreach (var agent in _agents)
-            {
-                _logger.LogDebug("{Agent} responding...", agent.Name);
-
-                var followUpPrompt = GetFollowUpPrompt(request, tickers);
-                chatHistory.AddUserMessage(followUpPrompt);
-
-                var response = await agent.GetFollowUp(_kernel, chatHistory);
-
-                _logger.LogDebug("{Agent}: {Response}", agent.Name, response);
-
-                conversation.Add(new AgentMessage(agent.Name, response, DateTime.UtcNow));
-                chatHistory.AddAssistantMessage(response);
-            }
-
-            // Summarize every 2 rounds to prevent history from growing too large
-            if (round % 2 == 0 && round < request.DiscussionRounds)
-            {
-                _logger.LogDebug("Summarizing discussion to prevent history overflow...");
-                await SummarizeHistory(chatHistory, tickers);
-            }
-        }
-
-        _logger.LogDebug("FINAL DECISION: Synthesizing...");
-
-        // Final decision by moderator with mode-specific prompt
-        var moderatorPrompt = GetModeratorPrompt(request, tickers);
-
-        chatHistory.AddUserMessage(moderatorPrompt);
-        var chatCompletion = _kernel.GetRequiredService<IChatCompletionService>();
-        var finalDecision = await chatCompletion.GetChatMessageContentAsync(chatHistory);
-
-        var decisionText = finalDecision.Content ?? "Unable to reach decision";
-
-        // Parse response based on mode
-        var (recommendations, summary) = ParseDecision(decisionText, request);
-
-        _logger.LogDebug("Analysis complete. Recommendations: {Count}", recommendations.Count);
-
-        return new AnalysisResult(
-            request.Tickers,
-            request.Mode,
-            request.Context,
-            conversation,
-            recommendations,
-            summary
-        );
-    }
-
-    private string GetInitialPrompt(StockRequest request)
-    {
-        var tickers = string.Join(", ", request.Tickers);
-        var context = !string.IsNullOrEmpty(request.Context) ? $" Context: {request.Context}." : "";
-
-        return request.Mode switch
-        {
-            AnalysisMode.Evaluate =>
-                $"We are analyzing whether to buy the following stocks: {tickers}.{context} Each agent will share their perspective on each stock.",
-
-            AnalysisMode.Compare =>
-                $"We are comparing these stocks to determine which is the best investment: {tickers}.{context} Each agent will compare and contrast them.",
-
-            AnalysisMode.Rank =>
-                $"We are ranking these stocks from best to worst investment opportunity: {tickers}.{context} Each agent will provide their ranking perspective.",
-
-            AnalysisMode.PickOne =>
-                $"We need to pick ONE stock to buy from this list: {tickers}.{context} Each agent will argue for their top choice.",
-
-            AnalysisMode.PortfolioReview =>
-                $"We currently own these stocks and need to decide whether to hold or sell each: {tickers}.{context} Each agent will review the portfolio.",
-
-            AnalysisMode.BuyOrSell =>
-                $"For each of these stocks, we need to decide BUY, SELL, or HOLD: {tickers}.{context} Each agent will provide their action for each stock.",
-
-            AnalysisMode.Diversify =>
-                $"We want to build a diversified portfolio from these stocks: {tickers}.{context} Each agent will suggest which combination makes sense.",
-
-            _ => $"We are analyzing these stocks: {tickers}.{context}"
-        };
-    }
-
-    private string GetFollowUpPrompt(StockRequest request, string tickers)
-    {
-        return request.Mode switch
-        {
-            AnalysisMode.Compare => $"Respond to other analysts' comparisons of {tickers}. Which stock do you still think is best?",
-            AnalysisMode.PickOne => $"Defend or reconsider your top pick from {tickers} based on others' arguments.",
-            AnalysisMode.PortfolioReview => $"Respond to others' hold/sell recommendations for {tickers}.",
-            _ => $"Respond to the other analysts' points about {tickers}. Do you agree or disagree? Keep it brief."
-        };
-    }
-
-    private string GetModeratorPrompt(StockRequest request, string tickers)
-    {
-        return request.Mode switch
-        {
-            AnalysisMode.Evaluate =>
-                $@"Based on the discussion, provide a recommendation for EACH stock in {tickers}.
-                    Format as JSON:
-                    {{
-                      ""recommendations"": [
-                        {{""ticker"": ""AAPL"", ""action"": ""Buy"", ""reasoning"": ""Strong fundamentals...""}},
-                        {{""ticker"": ""MSFT"", ""action"": ""Hold"", ""reasoning"": ""Fair value...""}}
-                      ],
-                      ""summary"": ""Overall market outlook...""
-                    }}
-                    Actions: StrongBuy, Buy, Hold, Sell, StrongSell, Avoid",
-
-            AnalysisMode.Compare =>
-                $@"Based on the discussion, determine which stock is the BEST investment from {tickers}.
-                    Format as JSON:
-                    {{
-                      ""recommendations"": [
-                        {{""ticker"": ""WINNER"", ""action"": ""StrongBuy"", ""reasoning"": ""This is the best because...""}},
-                        {{""ticker"": ""RUNNER_UP"", ""action"": ""Hold"", ""reasoning"": ""Good but not as strong...""}}
-                      ],
-                      ""summary"": ""The winner is X because...""
-                    }}",
-
-            AnalysisMode.Rank =>
-                $@"Based on the discussion, rank all stocks in {tickers} from BEST to WORST.
-                    Format as JSON:
-                    {{
-                      ""recommendations"": [
-                        {{""ticker"": ""BEST"", ""action"": ""StrongBuy"", ""reasoning"": ""Top choice because..."", ""rank"": 1}},
-                        {{""ticker"": ""SECOND"", ""action"": ""Buy"", ""reasoning"": ""Good option..."", ""rank"": 2}},
-                        {{""ticker"": ""WORST"", ""action"": ""Avoid"", ""reasoning"": ""Too risky..."", ""rank"": 3}}
-                      ],
-                      ""summary"": ""Ranking rationale...""
-                    }}",
-
-            AnalysisMode.PickOne =>
-                $@"Based on the discussion, pick ONE stock from {tickers} to buy.
-                    Format as JSON:
-                    {{
-                      ""recommendations"": [
-                        {{""ticker"": ""CHOSEN_ONE"", ""action"": ""StrongBuy"", ""reasoning"": ""This is the one because...""}}
-                      ],
-                      ""summary"": ""We choose X because...""
-                    }}",
-
-            AnalysisMode.PortfolioReview =>
-                $@"Based on the discussion, decide whether to HOLD or SELL each stock in {tickers}.
-                    Format as JSON:
-                    {{
-                      ""recommendations"": [
-                        {{""ticker"": ""AAPL"", ""action"": ""Hold"", ""reasoning"": ""Still has potential...""}},
-                        {{""ticker"": ""MSFT"", ""action"": ""Sell"", ""reasoning"": ""Time to take profits...""}}
-                      ],
-                      ""summary"": ""Portfolio action plan...""
-                    }}
-                    Actions: Hold, Sell, StrongSell",
-
-            AnalysisMode.BuyOrSell =>
-                $@"Based on the discussion, provide BUY/SELL/HOLD for EACH stock in {tickers}.
-                    Format as JSON:
-                    {{
-                      ""recommendations"": [
-                        {{""ticker"": ""AAPL"", ""action"": ""Buy"", ""reasoning"": ""Undervalued...""}},
-                        {{""ticker"": ""MSFT"", ""action"": ""Sell"", ""reasoning"": ""Overextended...""}},
-                        {{""ticker"": ""GOOGL"", ""action"": ""Hold"", ""reasoning"": ""Wait and see...""}}
-                      ],
-                      ""summary"": ""Trading strategy...""
-                    }}
-                    Actions: StrongBuy, Buy, Hold, Sell, StrongSell",
-
-            AnalysisMode.Diversify =>
-                $@"Based on the discussion, suggest which stocks from {tickers} to combine for a diversified portfolio.
-                    Format as JSON:
-                    {{
-                      ""recommendations"": [
-                        {{""ticker"": ""AAPL"", ""action"": ""Buy"", ""reasoning"": ""Core holding for tech exposure...""}},
-                        {{""ticker"": ""JNJ"", ""action"": ""Buy"", ""reasoning"": ""Defensive healthcare balance...""}},
-                        {{""ticker"": ""TSLA"", ""action"": ""Avoid"", ""reasoning"": ""Too volatile for this portfolio...""}}
-                      ],
-                      ""summary"": ""Suggested portfolio composition...""
-                    }}",
-
-            _ => $"Provide recommendations for {tickers} in JSON format."
-        };
-    }
-
-    private (Dictionary<string, StockRecommendation> recommendations, string summary) ParseDecision(string decisionText, StockRequest request)
-    {
-        var recommendations = new Dictionary<string, StockRecommendation>();
-        var summary = "";
+        var startTime = DateTime.UtcNow;
 
         try
         {
-            // Try to parse JSON response
-            var jsonStart = decisionText.IndexOf('{');
-            var jsonEnd = decisionText.LastIndexOf('}');
+            // PHASE 1: Data Collection
+            _logger.LogInformation("Phase 1: Market Data Collection");
+            var stockData = await _stockDataService.GetMultipleStocksAsync(request.Tickers, cancellationToken);
+            conversation.Add(new AgentMessage("System",
+                $"Market data collected for {tickers} at {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}",
+                DateTime.UtcNow));
 
-            if (jsonStart >= 0 && jsonEnd > jsonStart)
+            // PHASE 2: Parallel Analyst Execution
+            _logger.LogInformation("Phase 2: Analyst Team Analysis (Parallel)");
+            var analystTasks = _analysts.Select(a => a.AnalyzeAsync(_kernel, stockData, request.Mode, cancellationToken));
+            var analystReports = await Task.WhenAll(analystTasks);
+
+            foreach (var report in analystReports)
             {
-                var jsonText = decisionText.Substring(jsonStart, jsonEnd - jsonStart + 1);
-                var doc = JsonDocument.Parse(jsonText);
+                var subsummary = FormatAnalystReport(report);
+                conversation.Add(new AgentMessage(report.AgentName, subsummary, report.Timestamp));
+            }
 
-                if (doc.RootElement.TryGetProperty("summary", out var summaryElement))
-                {
-                    summary = summaryElement.GetString() ?? "";
-                }
+            // PHASE 3: Researcher Debate
+            _logger.LogInformation("Phase 3: Researcher Team Debate");
+            var debateResult = await ConductResearcherDebate(
+                stockData,
+                analystReports,
+                request.Mode,
+                request.DiscussionRounds,
+                cancellationToken);
 
-                if (doc.RootElement.TryGetProperty("recommendations", out var recsElement))
+            conversation.AddRange(debateResult.Messages);
+
+            // PHASE 4: Trader Decision
+            _logger.LogInformation("Phase 4: Trader Decision-Making");
+            var tradeDecisions = await MakeTraderDecisions(
+                stockData,
+                analystReports,
+                debateResult.Conclusion,
+                request.Mode,
+                cancellationToken);
+
+            foreach (var (ticker, decision) in tradeDecisions)
+            {
+                var msg = $"{ticker}: {decision.Action} ({decision.Confidence:P0} confidence)\n" +
+                         $"Suggested Allocation: {decision.SuggestedAllocation:P1}\n" +
+                         $"Rationale: {decision.Rationale}";
+                conversation.Add(new AgentMessage("Trader", msg, DateTime.UtcNow));
+            }
+
+            // PHASE 5: Risk Management Review
+            _logger.LogInformation("Phase 5: Risk Management Assessment");
+            var riskAssessments = await _riskManager.AssessRisk(
+                _kernel,
+                stockData,
+                tradeDecisions,
+                portfolioValue,
+                cancellationToken);
+
+            foreach (var (ticker, assessment) in riskAssessments)
+            {
+                var msg = $"{ticker} Risk Assessment:\n" +
+                         $"  VaR (95%): ${assessment.ValueAtRisk:N0}\n" +
+                         $"  CVaR: ${assessment.ConditionalVaR:N0}\n" +
+                         $"  Risk Level: {assessment.RiskLevel}\n" +
+                         $"  Position Size: {assessment.SuggestedPositionSize:P1}\n" +
+                         $"  Risk Factors: {string.Join(", ", assessment.RiskFactors)}";
+                conversation.Add(new AgentMessage("Risk_Manager", msg, DateTime.UtcNow));
+            }
+
+            // PHASE 6: Portfolio Construction
+            _logger.LogInformation("Phase 6: Portfolio Construction");
+            var portfolioDecision = await _portfolioManager.ConstructPortfolio(
+                _kernel,
+                tradeDecisions,
+                riskAssessments,
+                request.Mode,
+                portfolioValue,
+                cancellationToken);
+
+            var portfolioMsg = $"Portfolio Score: {portfolioDecision.PortfolioScore:F1}/100\n" +
+                              $"Positions: {portfolioDecision.Positions.Count}\n\n" +
+                              $"{portfolioDecision.ExecutionPlan}";
+            conversation.Add(new AgentMessage("Portfolio_Manager", portfolioMsg, DateTime.UtcNow));
+
+            // Generate final summary
+            var summary = GenerateFinalSummary(
+                request,
+                analystReports,
+                debateResult.Conclusion,
+                tradeDecisions,
+                riskAssessments,
+                portfolioDecision);
+
+            var recommendations = tradeDecisions.ToDictionary(
+                kvp => kvp.Key,
+                kvp => new StockRecommendation(
+                    kvp.Key,
+                    kvp.Value.Action,
+                    kvp.Value.Rationale,
+                    null));
+
+            var executionTime = (DateTime.UtcNow - startTime).TotalSeconds;
+            _logger.LogInformation("Analysis completed in {Time:F1}s", executionTime);
+
+            return new AnalysisResult(
+                request.Tickers,
+                request.Mode,
+                request.Context,
+                conversation,
+                recommendations,
+                summary);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Analysis failed for {Tickers}", tickers);
+            throw new StockAnalysisException($"Failed to analyze: {ex.Message}", ex);
+        }
+    }
+
+    private async Task<(List<AgentMessage> Messages, string Conclusion)> ConductResearcherDebate(
+        Dictionary<string, StockData> stockData,
+        AnalystReport[] analystReports,
+        AnalysisMode mode,
+        int rounds,
+        CancellationToken ct)
+    {
+        var messages = new List<AgentMessage>();
+        var bullHistory = new ChatHistory(_researchers[0].SystemPrompt);
+        var bearHistory = new ChatHistory(_researchers[1].SystemPrompt);
+
+        var analystSummary = FormatAnalystReportsForDebate(analystReports);
+        bullHistory.AddSystemMessage(analystSummary);
+        bearHistory.AddSystemMessage(analystSummary);
+
+        var chatCompletion = _kernel.GetRequiredService<IChatCompletionService>();
+
+        for (int round = 1; round <= rounds; round++)
+        {
+            // Bull's turn
+            var bullPrompt = round == 1
+                ? "Present your BULLISH case based on analyst reports. Focus on opportunities and upside."
+                : "Respond to the bear's concerns. What data supports your bullish view?";
+
+            bullHistory.AddUserMessage(bullPrompt);
+            var bullResponse = await chatCompletion.GetChatMessageContentAsync(bullHistory, cancellationToken: ct);
+            var bullMessage = bullResponse.Content ?? "No response";
+
+            messages.Add(new AgentMessage("Bull_Researcher", bullMessage, DateTime.UtcNow));
+            bearHistory.AddUserMessage($"Bull argues: {bullMessage}");
+
+            // Bear's turn
+            var bearPrompt = round == 1
+                ? "Present your BEARISH case based on analyst reports. Focus on risks and downside."
+                : "Respond to the bull's arguments. What risks and concerns remain?";
+
+            bearHistory.AddUserMessage(bearPrompt);
+            var bearResponse = await chatCompletion.GetChatMessageContentAsync(bearHistory, cancellationToken: ct);
+            var bearMessage = bearResponse.Content ?? "No response";
+
+            messages.Add(new AgentMessage("Bear_Researcher", bearMessage, DateTime.UtcNow));
+            bullHistory.AddUserMessage($"Bear argues: {bearMessage}");
+        }
+
+        // Synthesis
+        var synthesisPrompt = "Synthesize the bull and bear debate into balanced conclusions for each stock.";
+        bullHistory.AddUserMessage(synthesisPrompt);
+        var synthesis = await chatCompletion.GetChatMessageContentAsync(bullHistory, cancellationToken: ct);
+
+        messages.Add(new AgentMessage("Debate_Synthesis", synthesis.Content ?? "Balanced view", DateTime.UtcNow));
+
+        return (messages, synthesis.Content ?? "Debate complete");
+    }
+
+    private async Task<Dictionary<string, TradeDecision>> MakeTraderDecisions(
+        Dictionary<string, StockData> stockData,
+        AnalystReport[] analystReports,
+        string debateConclusion,
+        AnalysisMode mode,
+        CancellationToken ct)
+    {
+        var prompt = $@"You are an experienced trader. Based on:
+1. Analyst reports (technical, fundamental, sentiment, news)
+2. Bull/Bear researcher debate
+3. Analysis mode: {mode}
+
+Make trading decisions. Respond ONLY in JSON:
+{{
+  ""decisions"": [
+    {{
+      ""ticker"": ""SYMBOL"",
+      ""action"": ""StrongBuy|Buy|Hold|Sell|StrongSell|Avoid"",
+      ""confidence"": 0.0-1.0,
+      ""suggestedAllocation"": 0.0-1.0,
+      ""rationale"": ""Reason based on analyst data and debate"",
+      ""keyFactors"": [""factor1"", ""factor2""]
+    }}
+  ]
+}}
+
+=== ANALYST SUMMARY ===
+{string.Join("\n", analystReports.Select(r => $"{r.AgentName}: {string.Join("; ", r.StockAnalyses.Select(s => $"{s.Key}: {s.Value.Summary}"))}"))}
+
+=== DEBATE CONCLUSION ===
+{debateConclusion}
+
+Make decisions for: {string.Join(", ", stockData.Keys)}";
+
+        var chatHistory = new ChatHistory();
+        chatHistory.AddUserMessage(prompt);
+
+        var chatCompletion = _kernel.GetRequiredService<IChatCompletionService>();
+        var response = await chatCompletion.GetChatMessageContentAsync(chatHistory, cancellationToken: ct);
+
+        return ParseTradeDecisions(response.Content ?? "", stockData.Keys.ToList());
+    }
+
+    private Dictionary<string, TradeDecision> ParseTradeDecisions(string json, List<string> tickers)
+    {
+        var decisions = new Dictionary<string, TradeDecision>();
+
+        try
+        {
+            var cleanJson = ExtractJson(json);
+            using var doc = JsonDocument.Parse(cleanJson);
+
+            if (doc.RootElement.TryGetProperty("decisions", out var decisionsArray))
+            {
+                foreach (var item in decisionsArray.EnumerateArray())
                 {
-                    foreach (var rec in recsElement.EnumerateArray())
+                    var ticker = item.GetProperty("ticker").GetString()?.ToUpperInvariant();
+                    if (string.IsNullOrEmpty(ticker)) continue;
+
+                    var actionStr = item.GetProperty("action").GetString() ?? "Hold";
+                    var action = Enum.TryParse<StockAction>(actionStr, true, out var a) ? a : StockAction.Hold;
+
+                    var confidence = item.TryGetProperty("confidence", out var c) ? c.GetDecimal() : 0.5m;
+                    var allocation = item.TryGetProperty("suggestedAllocation", out var sa) ? sa.GetDecimal() : 0.2m;
+                    var rationale = item.TryGetProperty("rationale", out var r) ? r.GetString() ?? "" : "";
+
+                    var factors = new List<string>();
+                    if (item.TryGetProperty("keyFactors", out var kf))
                     {
-                        var ticker = rec.GetProperty("ticker").GetString() ?? "";
-                        var actionStr = rec.GetProperty("action").GetString() ?? "Hold";
-                        var reasoning = rec.GetProperty("reasoning").GetString() ?? "";
-                        int? rank = rec.TryGetProperty("rank", out var rankProp) ? rankProp.GetInt32() : null;
-
-                        var action = Enum.TryParse<StockAction>(actionStr, true, out var parsedAction)
-                            ? parsedAction
-                            : StockAction.Hold;
-
-                        recommendations[ticker] = new StockRecommendation(ticker, action, reasoning, rank);
+                        factors.AddRange(kf.EnumerateArray().Select(f => f.GetString() ?? ""));
                     }
+
+                    decisions[ticker] = new TradeDecision(ticker, action, confidence, allocation, rationale, factors);
                 }
             }
         }
         catch (Exception ex)
         {
-            _logger.LogWarning("Failed to parse JSON response: {Error}", ex.Message);
-            // Fallback: create basic recommendations
-            foreach (var ticker in request.Tickers)
-            {
-                recommendations[ticker] = new StockRecommendation(
-                    ticker,
-                    StockAction.Hold,
-                    "Analysis completed - see conversation for details"
-                );
-            }
-            summary = decisionText;
+            _logger.LogWarning(ex, "Failed to parse trade decisions");
         }
 
-        return (recommendations, summary);
+        foreach (var ticker in tickers)
+        {
+            if (!decisions.ContainsKey(ticker.ToUpperInvariant()))
+            {
+                decisions[ticker.ToUpperInvariant()] = new TradeDecision(
+                    ticker.ToUpperInvariant(),
+                    StockAction.Hold,
+                    0.5m,
+                    0.1m,
+                    "Default decision - insufficient data",
+                    new List<string>());
+            }
+        }
+
+        return decisions;
     }
 
-    private async Task SummarizeHistory(ChatHistory chatHistory, string tickers)
+    private string FormatAnalystReport(AnalystReport report)
     {
-        // Keep only system message and create a summary of the discussion
-        var summaryPrompt = $@"Summarize the key points from the discussion about {tickers} so far. 
-            Include the main bullish arguments, bearish concerns, technical signals, and fundamental observations.
-            Keep it concise (4-5 sentences max).";
-
-        chatHistory.AddUserMessage(summaryPrompt);
-        var chatCompletion = _kernel.GetRequiredService<IChatCompletionService>();
-        var summary = await chatCompletion.GetChatMessageContentAsync(chatHistory);
-
-        // Clear history and start fresh with summary
-        var systemMessage = chatHistory.First(m => m.Role == AuthorRole.System);
-        chatHistory.Clear();
-        chatHistory.Add(systemMessage);
-        chatHistory.AddAssistantMessage($"Summary of discussion so far: {summary.Content}");
-
-        _logger.LogDebug("History summarized to prevent overflow");
+        var sb = new StringBuilder($"{report.AgentName} Analysis:\n");
+        foreach (var (ticker, analysis) in report.StockAnalyses)
+        {
+            sb.AppendLine($"\n{ticker}:");
+            if (analysis.Strengths.Any())
+                sb.AppendLine($"  Strengths: {string.Join("; ", analysis.Strengths)}");
+            if (analysis.Concerns.Any())
+                sb.AppendLine($"  Concerns: {string.Join("; ", analysis.Concerns)}");
+            sb.AppendLine($"  Summary: {analysis.Summary}");
+        }
+        return sb.ToString();
     }
+
+    private string FormatAnalystReportsForDebate(AnalystReport[] reports)
+    {
+        var sb = new StringBuilder("=== ANALYST REPORTS ===\n");
+        foreach (var report in reports)
+        {
+            sb.AppendLine($"\n{report.AgentName}:");
+            foreach (var (ticker, analysis) in report.StockAnalyses)
+            {
+                sb.AppendLine($"  {ticker}:");
+                sb.AppendLine($"    Strengths: {string.Join("; ", analysis.Strengths)}");
+                sb.AppendLine($"    Concerns: {string.Join("; ", analysis.Concerns)}");
+                sb.AppendLine($"    {analysis.Summary}");
+            }
+        }
+        return sb.ToString();
+    }
+
+    private string GenerateFinalSummary(
+        StockRequest request,
+        AnalystReport[] analystReports,
+        string debateConclusion,
+        Dictionary<string, TradeDecision> tradeDecisions,
+        Dictionary<string, RiskAssessment> riskAssessments,
+        PortfolioDecision portfolioDecision)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"=== FINAL RECOMMENDATION ({request.Mode}) ===\n");
+
+        sb.AppendLine("PORTFOLIO OVERVIEW:");
+        sb.AppendLine($"Portfolio Score: {portfolioDecision.PortfolioScore:F1}/100");
+        sb.AppendLine($"Total Positions: {portfolioDecision.Positions.Count}\n");
+
+        sb.AppendLine("POSITIONS:");
+        foreach (var (ticker, position) in portfolioDecision.Positions.OrderByDescending(p => p.Value.PercentAllocation))
+        {
+            var decision = tradeDecisions[ticker];
+            var risk = riskAssessments[ticker];
+
+            sb.AppendLine($"\n{ticker}:");
+            sb.AppendLine($"  Action: {position.Action} ({decision.Confidence:P0} confidence)");
+            sb.AppendLine($"  Allocation: {position.PercentAllocation:P1} (${position.DollarAmount:N0})");
+            sb.AppendLine($"  Risk Level: {risk.RiskLevel}");
+            sb.AppendLine($"  VaR (95%): ${risk.ValueAtRisk:N0}");
+            sb.AppendLine($"  Rationale: {decision.Rationale}");
+
+            if (decision.KeyFactors.Any())
+                sb.AppendLine($"  Key Factors: {string.Join(", ", decision.KeyFactors)}");
+        }
+
+        sb.AppendLine($"\nEXECUTION PLAN:\n{portfolioDecision.ExecutionPlan}");
+
+        return sb.ToString();
+    }
+
+    private string ExtractJson(string text)
+    {
+        text = text.Trim();
+        if (text.Contains("```json"))
+        {
+            var start = text.IndexOf("```json") + 7;
+            var end = text.IndexOf("```", start);
+            if (end > start) text = text.Substring(start, end - start).Trim();
+        }
+        var jsonStart = text.IndexOf('{');
+        var jsonEnd = text.LastIndexOf('}');
+        return jsonStart >= 0 && jsonEnd > jsonStart
+            ? text.Substring(jsonStart, jsonEnd - jsonStart + 1)
+            : text;
+    }
+
+    private void ValidateRequest(StockRequest request)
+    {
+        if (request.Tickers == null || !request.Tickers.Any())
+            throw new ArgumentException("At least one ticker required");
+        if (request.Tickers.Count > 10)
+            throw new ArgumentException("Maximum 10 tickers");
+        if (request.DiscussionRounds < 1 || request.DiscussionRounds > 5)
+            throw new ArgumentException("Discussion rounds must be 1-5");
+    }
+}
+
+public class StockAnalysisException : Exception
+{
+    public StockAnalysisException(string message) : base(message) { }
+    public StockAnalysisException(string message, Exception innerException) : base(message, innerException) { }
 }

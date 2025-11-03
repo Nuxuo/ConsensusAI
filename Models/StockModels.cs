@@ -4,7 +4,8 @@ public record StockRequest(
     List<string> Tickers,
     AnalysisMode Mode = AnalysisMode.Evaluate,
     int DiscussionRounds = 2,
-    string? Context = null
+    string? Context = null,
+    decimal PortfolioValue = 100000m  // Added for portfolio management
 );
 
 public record AnalysisResult(
