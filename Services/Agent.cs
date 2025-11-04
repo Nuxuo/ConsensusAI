@@ -1,5 +1,6 @@
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
+using Microsoft.SemanticKernel.Connectors.OpenAI;
 using ConsensusAI.Models;
 
 namespace ConsensusAI.Services;
@@ -23,9 +24,19 @@ public class Agent
         ChatHistory sharedHistory,
         AnalysisMode mode,
         string agentSpecificData,
+        bool enableWebSearch = false,
         CancellationToken cancellationToken = default)
     {
         var agentHistory = new ChatHistory(SystemPrompt);
+
+        // Add web search context to system prompt if enabled
+        if (enableWebSearch && kernel.Plugins.Contains("WebSearch"))
+        {
+            agentHistory.AddSystemMessage(@"You have access to web search via the WebSearch plugin. 
+Use it to find recent news, analyst reports, earnings data, or market trends for the stocks you're analyzing. 
+To search, include in your reasoning: 'I should search for [query]' and the system will provide results.");
+        }
+
         foreach (var message in sharedHistory) agentHistory.Add(message);
 
         var modeGuidance = mode switch
@@ -43,20 +54,46 @@ public class Agent
             ? $"\n\nYour specific data to analyze:\n{agentSpecificData}"
             : "";
 
-        var prompt = $@"As {Name}, provide your view on {tickers}.{modeGuidance}{dataSection}
+        var webSearchNote = enableWebSearch && kernel.Plugins.Contains("WebSearch")
+            ? "\n\nNote: You can search the web for recent information if needed."
+            : "";
+
+        var prompt = $@"As {Name}, provide your view on {tickers}.{modeGuidance}{dataSection}{webSearchNote}
 
 IMPORTANT: Base your analysis on the ACTUAL DATA PROVIDED. Reference specific metrics, prices, and indicators.
 Be specific and data-driven. Keep response to 3-5 sentences focusing on key points.";
 
         agentHistory.AddUserMessage(prompt);
+
         var chatCompletion = kernel.GetRequiredService<IChatCompletionService>();
-        var response = await chatCompletion.GetChatMessageContentAsync(agentHistory, cancellationToken: cancellationToken);
+
+        // Enable auto function calling if web search is available
+        var executionSettings = enableWebSearch && kernel.Plugins.Contains("WebSearch")
+            ? new OpenAIPromptExecutionSettings { ToolCallBehavior = ToolCallBehavior.AutoInvokeKernelFunctions }
+            : null;
+
+        var response = await chatCompletion.GetChatMessageContentAsync(
+            agentHistory,
+            executionSettings,
+            kernel,
+            cancellationToken);
+
         return response.Content ?? "No response";
     }
 
-    public async Task<string> GetFollowUp(Kernel kernel, ChatHistory sharedHistory, CancellationToken cancellationToken = default)
+    public async Task<string> GetFollowUp(
+        Kernel kernel,
+        ChatHistory sharedHistory,
+        bool enableWebSearch = false,
+        CancellationToken cancellationToken = default)
     {
         var agentHistory = new ChatHistory(SystemPrompt);
+
+        if (enableWebSearch && kernel.Plugins.Contains("WebSearch"))
+        {
+            agentHistory.AddSystemMessage("You can use web search to verify claims or find additional data.");
+        }
+
         foreach (var message in sharedHistory) agentHistory.Add(message);
 
         var prompt = @"Based on other agents' views, respond briefly:
@@ -66,8 +103,19 @@ Be specific and data-driven. Keep response to 3-5 sentences focusing on key poin
 Keep response to 2-3 sentences, focusing on DATA-DRIVEN insights.";
 
         agentHistory.AddUserMessage(prompt);
+
         var chatCompletion = kernel.GetRequiredService<IChatCompletionService>();
-        var response = await chatCompletion.GetChatMessageContentAsync(agentHistory, cancellationToken: cancellationToken);
+
+        var executionSettings = enableWebSearch && kernel.Plugins.Contains("WebSearch")
+            ? new OpenAIPromptExecutionSettings { ToolCallBehavior = ToolCallBehavior.AutoInvokeKernelFunctions }
+            : null;
+
+        var response = await chatCompletion.GetChatMessageContentAsync(
+            agentHistory,
+            executionSettings,
+            kernel,
+            cancellationToken);
+
         return response.Content ?? "No response";
     }
 
@@ -75,6 +123,7 @@ Keep response to 2-3 sentences, focusing on DATA-DRIVEN insights.";
         Kernel kernel,
         Dictionary<string, StockData> stockData,
         AnalysisMode mode,
+        bool enableWebSearch = false,
         CancellationToken cancellationToken = default)
     {
         var analyses = new Dictionary<string, AgentAnalysis>();
@@ -93,7 +142,7 @@ Keep response to 2-3 sentences, focusing on DATA-DRIVEN insights.";
             }
 
             var (metrics, strengths, concerns) = AnalyzeStock(data);
-            var summary = await GenerateSummary(kernel, ticker, data, strengths, concerns, mode, cancellationToken);
+            var summary = await GenerateSummary(kernel, ticker, data, strengths, concerns, mode, enableWebSearch, cancellationToken);
 
             analyses[ticker] = new AgentAnalysis(ticker, metrics, strengths, concerns, summary);
         }
@@ -204,19 +253,35 @@ Keep response to 2-3 sentences, focusing on DATA-DRIVEN insights.";
         List<string> strengths,
         List<string> concerns,
         AnalysisMode mode,
+        bool enableWebSearch,
         CancellationToken cancellationToken)
     {
+        var webSearchNote = enableWebSearch && kernel.Plugins.Contains("WebSearch")
+            ? " You may search for recent news if helpful."
+            : "";
+
         var prompt = $@"{Role} analysis for {ticker}:
 Price: ${data.CurrentPrice:F2}
 Strengths: {string.Join("; ", strengths)}
 Concerns: {string.Join("; ", concerns)}
 
-Based on mode '{mode}', provide a 2-3 sentence {Role.ToLower()} summary.";
+Based on mode '{mode}', provide a 2-3 sentence {Role.ToLower()} summary.{webSearchNote}";
 
         var chatHistory = new ChatHistory(SystemPrompt);
         chatHistory.AddUserMessage(prompt);
+
         var chatCompletion = kernel.GetRequiredService<IChatCompletionService>();
-        var response = await chatCompletion.GetChatMessageContentAsync(chatHistory, cancellationToken: cancellationToken);
+
+        var executionSettings = enableWebSearch && kernel.Plugins.Contains("WebSearch")
+            ? new OpenAIPromptExecutionSettings { ToolCallBehavior = ToolCallBehavior.AutoInvokeKernelFunctions }
+            : null;
+
+        var response = await chatCompletion.GetChatMessageContentAsync(
+            chatHistory,
+            executionSettings,
+            kernel,
+            cancellationToken);
+
         return response.Content ?? "No analysis available";
     }
 

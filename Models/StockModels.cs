@@ -5,7 +5,8 @@ public record StockRequest(
     AnalysisMode Mode = AnalysisMode.Evaluate,
     int DiscussionRounds = 2,
     string? Context = null,
-    decimal PortfolioValue = 100000m  // Added for portfolio management
+    decimal PortfolioValue = 100000m,
+    bool EnableWebSearch = false
 );
 
 public record AnalysisResult(

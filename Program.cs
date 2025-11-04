@@ -15,17 +15,41 @@ builder.Services.AddMemoryCache();
 
 builder.Services.AddHttpClient<IStockDataService, EodhdStockDataService>()
     .SetHandlerLifetime(TimeSpan.FromMinutes(5))
+    .ConfigureHttpClient(client =>
+    {
+        // Increase timeout to 5 minutes for stock data operations
+        client.Timeout = TimeSpan.FromMinutes(5);
+    })
     .AddPolicyHandler(HttpPolicyExtensions
         .HandleTransientHttpError()
         .WaitAndRetryAsync(3, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt))));
 
+builder.Services.AddSingleton<WebSearchService>();
+
 builder.Services.AddSingleton<Kernel>(sp =>
 {
-    return Kernel.CreateBuilder()
+    var logger = sp.GetRequiredService<ILogger<Program>>();
+
+    var kernel = Kernel.CreateBuilder()
         .AddOpenAIChatCompletion(
             modelId: builder.Configuration["OpenAI:Model"] ?? "gpt-4",
-            apiKey: openAiKey)
+            apiKey: openAiKey,
+            httpClient: new HttpClient
+            {
+                // Increase OpenAI timeout to 5 minutes
+                Timeout = TimeSpan.FromMinutes(5)
+            })
         .Build();
+
+    // Add web search if configured
+    var webSearchService = sp.GetRequiredService<WebSearchService>();
+    if (webSearchService.IsConfigured)
+    {
+        webSearchService.AddWebSearchToKernel(kernel);
+        logger.LogInformation("Web search enabled");
+    }
+
+    return kernel;
 });
 
 builder.Services.AddSingleton<StockAnalysisOrchestrator>();
@@ -66,11 +90,19 @@ app.UseExceptionHandler(errorApp =>
 {
     errorApp.Run(async context =>
     {
+        var logger = context.RequestServices.GetRequiredService<ILogger<Program>>();
+        var exceptionFeature = context.Features.Get<IExceptionHandlerFeature>();
+
+        if (exceptionFeature?.Error != null)
+        {
+            logger.LogError(exceptionFeature.Error, "Unhandled exception: {Message}", exceptionFeature.Error.Message);
+        }
+
         context.Response.StatusCode = 500;
         context.Response.ContentType = "application/json";
         var error = new ApiError(
             "An error occurred processing your request",
-            app.Environment.IsDevelopment() ? context.Features.Get<IExceptionHandlerFeature>()?.Error?.Message : null);
+            app.Environment.IsDevelopment() ? exceptionFeature?.Error?.Message : null);
         await context.Response.WriteAsJsonAsync(error);
     });
 });
@@ -83,20 +115,48 @@ app.UseSwaggerUI();
 app.MapHealthChecks("/health");
 
 // Main analysis endpoint with enhanced multi-agent system
-app.MapPost("/api/v1/analyze", async (StockRequest request, StockAnalysisOrchestrator orchestrator, CancellationToken ct) =>
+app.MapPost("/api/v1/analyze", async (
+    StockRequest request,
+    StockAnalysisOrchestrator orchestrator,
+    ILogger<Program> logger,
+    CancellationToken ct) =>
 {
     try
     {
+        logger.LogInformation("═══════════════════════════════════════════════════════");
+        logger.LogInformation("🚀 STARTING ANALYSIS");
+        logger.LogInformation("   Tickers: {Tickers}", string.Join(", ", request.Tickers));
+        logger.LogInformation("   Mode: {Mode}", request.Mode);
+        logger.LogInformation("   Rounds: {Rounds}", request.DiscussionRounds);
+        logger.LogInformation("   Web Search: {WebSearch}", request.EnableWebSearch ? "ENABLED" : "DISABLED");
+        logger.LogInformation("═══════════════════════════════════════════════════════");
+
         var result = await orchestrator.AnalyzeStock(request, request.PortfolioValue, ct);
+
+        logger.LogInformation("✅ ANALYSIS COMPLETE - Summary generated");
+        logger.LogInformation("═══════════════════════════════════════════════════════");
+
         return Results.Ok(result);
     }
     catch (ArgumentException ex)
     {
+        logger.LogWarning("Invalid request: {Message}", ex.Message);
         return Results.BadRequest(new ApiError("Invalid request", ex.Message));
+    }
+    catch (OperationCanceledException)
+    {
+        logger.LogWarning("Analysis cancelled by user");
+        return Results.Problem(detail: "Analysis was cancelled", statusCode: 499);
     }
     catch (StockAnalysisException ex)
     {
+        logger.LogError(ex, "Analysis failed: {Message}", ex.Message);
         return Results.Problem(detail: ex.Message, statusCode: 500, title: "Analysis failed");
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Unexpected error during analysis: {Message}", ex.Message);
+        return Results.Problem(detail: "An unexpected error occurred", statusCode: 500);
     }
 })
 .WithName("AnalyzeStocks")
@@ -108,7 +168,8 @@ app.MapPost("/api/v1/analyze", async (StockRequest request, StockAnalysisOrchest
 - Trader decision-making with confidence scores
 - Risk Management (VaR, CVaR, position sizing, veto power)
 - Portfolio Construction with diversification and scoring
-- Execution planning and risk-adjusted allocations");
+- Execution planning and risk-adjusted allocations
+- Optional web search for real-time market data");
 
 // Legacy endpoint for backward compatibility
 app.MapPost("/analyze-stock", async (StockRequest request, StockAnalysisOrchestrator orchestrator, CancellationToken ct) =>
@@ -139,15 +200,22 @@ app.MapGet("/api/v1/analysis-modes", () =>
 .WithName("GetAnalysisModes")
 .WithOpenApi();
 
-app.MapGet("/api/v1/stock-data/{ticker}", async (string ticker, IStockDataService stockDataService, CancellationToken ct) =>
+app.MapGet("/api/v1/stock-data/{ticker}", async (
+    string ticker,
+    IStockDataService stockDataService,
+    ILogger<Program> logger,
+    CancellationToken ct) =>
 {
     try
     {
+        logger.LogInformation("Fetching stock data for {Ticker}", ticker);
         var data = await stockDataService.GetStockDataAsync(ticker, ct);
+        logger.LogInformation("Stock data retrieved for {Ticker}", ticker);
         return Results.Ok(data);
     }
     catch (Exception ex)
     {
+        logger.LogError(ex, "Failed to fetch stock data for {Ticker}: {Message}", ticker, ex.Message);
         return Results.Problem(detail: ex.Message, statusCode: 500, title: "Data fetch failed");
     }
 })
@@ -170,6 +238,7 @@ app.MapGet("/api/v1/system-info", () =>
             "Parallel Analyst Execution",
             "Kelly Criterion Position Sizing",
             "Real-time Market Data (EODHD)",
+            "Optional Web Search (Bing)",
             "Structured Communication Protocol"
         },
         Workflow = new[]
@@ -185,8 +254,13 @@ app.MapGet("/api/v1/system-info", () =>
         {
             TargetSharpeRatio = "6.0+",
             TargetMaxDrawdown = "<2%",
-            AnalysisTime = "10-15s",
+            AnalysisTime = "10-30s (depending on web search)",
             MaxTickers = 10
+        },
+        Timeouts = new
+        {
+            HttpClient = "5 minutes",
+            OverallOperation = "10 minutes (recommended)"
         },
         BasedOn = new[]
         {

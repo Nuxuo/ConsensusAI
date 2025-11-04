@@ -1,4 +1,4 @@
-using Microsoft.SemanticKernel;
+﻿using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
 using ConsensusAI.Models;
 using System.Text.Json;
@@ -64,23 +64,39 @@ public class StockAnalysisOrchestrator
         ValidateRequest(request);
 
         var tickers = string.Join(", ", request.Tickers);
-        _logger.LogInformation("Starting {Mode} analysis for {Tickers}", request.Mode, tickers);
-
         var conversation = new List<AgentMessage>();
         var startTime = DateTime.UtcNow;
 
         try
         {
             // PHASE 1: Data Collection
-            _logger.LogInformation("Phase 1: Market Data Collection");
+            _logger.LogInformation("📊 PHASE 1: Market Data Collection");
+            _logger.LogInformation("   → Fetching data for {Count} ticker(s)...", request.Tickers.Count);
+
             var stockData = await _stockDataService.GetMultipleStocksAsync(request.Tickers, cancellationToken);
+
+            foreach (var ticker in request.Tickers)
+            {
+                if (stockData.TryGetValue(ticker, out var data) && data.DataAvailable)
+                {
+                    _logger.LogInformation("   ✓ {Ticker}: ${Price:F2} | RSI: {RSI:F1} | Volume: {Volume:N0}",
+                        ticker, data.CurrentPrice, data.RSI, data.Volume);
+                }
+                else
+                {
+                    _logger.LogWarning("   ✗ {Ticker}: Data unavailable", ticker);
+                }
+            }
+
             conversation.Add(new AgentMessage("System",
                 $"Market data collected for {tickers} at {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}",
                 DateTime.UtcNow));
 
             // PHASE 2: Parallel Analyst Execution
-            _logger.LogInformation("Phase 2: Analyst Team Analysis (Parallel)");
-            var analystTasks = _analysts.Select(a => a.AnalyzeAsync(_kernel, stockData, request.Mode, cancellationToken));
+            _logger.LogInformation("");
+            _logger.LogInformation("🔬 PHASE 2: Analyst Team Analysis (Parallel)");
+
+            var analystTasks = _analysts.Select(a => AnalyzeWithLogging(a, stockData, request.Mode, request.EnableWebSearch, cancellationToken));
             var analystReports = await Task.WhenAll(analystTasks);
 
             foreach (var report in analystReports)
@@ -90,27 +106,40 @@ public class StockAnalysisOrchestrator
             }
 
             // PHASE 3: Researcher Debate
-            _logger.LogInformation("Phase 3: Researcher Team Debate");
+            _logger.LogInformation("");
+            _logger.LogInformation("⚔️  PHASE 3: Bull vs Bear Debate");
+            _logger.LogInformation("   Running {Rounds} debate round(s)...", request.DiscussionRounds);
+
             var debateResult = await ConductResearcherDebate(
                 stockData,
                 analystReports,
                 request.Mode,
                 request.DiscussionRounds,
+                request.EnableWebSearch,
                 cancellationToken);
 
             conversation.AddRange(debateResult.Messages);
 
             // PHASE 4: Trader Decision
-            _logger.LogInformation("Phase 4: Trader Decision-Making");
+            _logger.LogInformation("");
+            _logger.LogInformation("💼 PHASE 4: Trader Decision-Making");
+
             var tradeDecisions = await MakeTraderDecisions(
                 stockData,
                 analystReports,
                 debateResult.Conclusion,
                 request.Mode,
+                request.EnableWebSearch,
                 cancellationToken);
 
-            foreach (var (ticker, decision) in tradeDecisions)
+            foreach (KeyValuePair<string, TradeDecision> kvp in tradeDecisions)
             {
+                var ticker = kvp.Key;
+                var decision = kvp.Value;
+
+                _logger.LogInformation("   → {Ticker}: {Action} ({Confidence:P0} confidence, {Allocation:P0} suggested)",
+                    ticker, decision.Action, decision.Confidence, decision.SuggestedAllocation);
+
                 var msg = $"{ticker}: {decision.Action} ({decision.Confidence:P0} confidence)\n" +
                          $"Suggested Allocation: {decision.SuggestedAllocation:P1}\n" +
                          $"Rationale: {decision.Rationale}";
@@ -118,7 +147,9 @@ public class StockAnalysisOrchestrator
             }
 
             // PHASE 5: Risk Management Review
-            _logger.LogInformation("Phase 5: Risk Management Assessment");
+            _logger.LogInformation("");
+            _logger.LogInformation("🛡️  PHASE 5: Risk Management Assessment");
+
             var riskAssessments = await _riskManager.AssessRisk(
                 _kernel,
                 stockData,
@@ -126,8 +157,14 @@ public class StockAnalysisOrchestrator
                 portfolioValue,
                 cancellationToken);
 
-            foreach (var (ticker, assessment) in riskAssessments)
+            foreach (KeyValuePair<string, RiskAssessment> kvp in riskAssessments)
             {
+                var ticker = kvp.Key;
+                var assessment = kvp.Value;
+
+                _logger.LogInformation("   → {Ticker}: {RiskLevel} risk | VaR: ${VaR:N0} | Position: {Position:P1}",
+                    ticker, assessment.RiskLevel, assessment.ValueAtRisk, assessment.SuggestedPositionSize);
+
                 var msg = $"{ticker} Risk Assessment:\n" +
                          $"  VaR (95%): ${assessment.ValueAtRisk:N0}\n" +
                          $"  CVaR: ${assessment.ConditionalVaR:N0}\n" +
@@ -138,7 +175,9 @@ public class StockAnalysisOrchestrator
             }
 
             // PHASE 6: Portfolio Construction
-            _logger.LogInformation("Phase 6: Portfolio Construction");
+            _logger.LogInformation("");
+            _logger.LogInformation("📈 PHASE 6: Portfolio Construction");
+
             var portfolioDecision = await _portfolioManager.ConstructPortfolio(
                 _kernel,
                 tradeDecisions,
@@ -146,6 +185,15 @@ public class StockAnalysisOrchestrator
                 request.Mode,
                 portfolioValue,
                 cancellationToken);
+
+            _logger.LogInformation("   Portfolio Score: {Score:F1}/100", portfolioDecision.PortfolioScore);
+            _logger.LogInformation("   Total Positions: {Count}", portfolioDecision.Positions.Count);
+
+            foreach (var (ticker, position) in portfolioDecision.Positions.OrderByDescending(p => p.Value.PercentAllocation))
+            {
+                _logger.LogInformation("   → {Ticker}: {Allocation:P1} (${Amount:N0})",
+                    ticker, position.PercentAllocation, position.DollarAmount);
+            }
 
             var portfolioMsg = $"Portfolio Score: {portfolioDecision.PortfolioScore:F1}/100\n" +
                               $"Positions: {portfolioDecision.Positions.Count}\n\n" +
@@ -170,7 +218,8 @@ public class StockAnalysisOrchestrator
                     null));
 
             var executionTime = (DateTime.UtcNow - startTime).TotalSeconds;
-            _logger.LogInformation("Analysis completed in {Time:F1}s", executionTime);
+            _logger.LogInformation("");
+            _logger.LogInformation("⏱️  Total execution time: {Time:F1}s", executionTime);
 
             return new AnalysisResult(
                 request.Tickers,
@@ -182,9 +231,22 @@ public class StockAnalysisOrchestrator
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Analysis failed for {Tickers}", tickers);
+            _logger.LogError(ex, "❌ Analysis failed for {Tickers}: {Message}", tickers, ex.Message);
             throw new StockAnalysisException($"Failed to analyze: {ex.Message}", ex);
         }
+    }
+
+    private async Task<AnalystReport> AnalyzeWithLogging(
+        Agent agent,
+        Dictionary<string, StockData> stockData,
+        AnalysisMode mode,
+        bool enableWebSearch,
+        CancellationToken ct)
+    {
+        _logger.LogInformation("   → {Agent}: Starting analysis...", agent.Name);
+        var report = await agent.AnalyzeAsync(_kernel, stockData, mode, enableWebSearch, ct);
+        _logger.LogInformation("   ✓ {Agent}: Complete", agent.Name);
+        return report;
     }
 
     private async Task<(List<AgentMessage> Messages, string Conclusion)> ConductResearcherDebate(
@@ -192,6 +254,7 @@ public class StockAnalysisOrchestrator
         AnalystReport[] analystReports,
         AnalysisMode mode,
         int rounds,
+        bool enableWebSearch,
         CancellationToken ct)
     {
         var messages = new List<AgentMessage>();
@@ -206,7 +269,10 @@ public class StockAnalysisOrchestrator
 
         for (int round = 1; round <= rounds; round++)
         {
+            _logger.LogInformation("   Round {Round}/{Total}:", round, rounds);
+
             // Bull's turn
+            _logger.LogInformation("      🐂 Bull researcher analyzing...");
             var bullPrompt = round == 1
                 ? "Present your BULLISH case based on analyst reports. Focus on opportunities and upside."
                 : "Respond to the bear's concerns. What data supports your bullish view?";
@@ -218,7 +284,10 @@ public class StockAnalysisOrchestrator
             messages.Add(new AgentMessage("Bull_Researcher", bullMessage, DateTime.UtcNow));
             bearHistory.AddUserMessage($"Bull argues: {bullMessage}");
 
+            _logger.LogInformation("      ✓ Bull case presented");
+
             // Bear's turn
+            _logger.LogInformation("      🐻 Bear researcher analyzing...");
             var bearPrompt = round == 1
                 ? "Present your BEARISH case based on analyst reports. Focus on risks and downside."
                 : "Respond to the bull's arguments. What risks and concerns remain?";
@@ -229,14 +298,18 @@ public class StockAnalysisOrchestrator
 
             messages.Add(new AgentMessage("Bear_Researcher", bearMessage, DateTime.UtcNow));
             bullHistory.AddUserMessage($"Bear argues: {bearMessage}");
+
+            _logger.LogInformation("      ✓ Bear case presented");
         }
 
         // Synthesis
+        _logger.LogInformation("   → Synthesizing debate conclusions...");
         var synthesisPrompt = "Synthesize the bull and bear debate into balanced conclusions for each stock.";
         bullHistory.AddUserMessage(synthesisPrompt);
         var synthesis = await chatCompletion.GetChatMessageContentAsync(bullHistory, cancellationToken: ct);
 
         messages.Add(new AgentMessage("Debate_Synthesis", synthesis.Content ?? "Balanced view", DateTime.UtcNow));
+        _logger.LogInformation("   ✓ Debate synthesis complete");
 
         return (messages, synthesis.Content ?? "Debate complete");
     }
@@ -246,8 +319,11 @@ public class StockAnalysisOrchestrator
         AnalystReport[] analystReports,
         string debateConclusion,
         AnalysisMode mode,
+        bool enableWebSearch,
         CancellationToken ct)
     {
+        _logger.LogInformation("   → Evaluating trade opportunities...");
+
         var prompt = $@"You are an experienced trader. Based on:
 1. Analyst reports (technical, fundamental, sentiment, news)
 2. Bull/Bear researcher debate
@@ -280,6 +356,8 @@ Make decisions for: {string.Join(", ", stockData.Keys)}";
 
         var chatCompletion = _kernel.GetRequiredService<IChatCompletionService>();
         var response = await chatCompletion.GetChatMessageContentAsync(chatHistory, cancellationToken: ct);
+
+        _logger.LogInformation("   ✓ Trade decisions generated");
 
         return ParseTradeDecisions(response.Content ?? "", stockData.Keys.ToList());
     }
