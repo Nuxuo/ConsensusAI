@@ -25,6 +25,8 @@ builder.Services.AddHttpClient<IStockDataService, EodhdStockDataService>()
         .WaitAndRetryAsync(3, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt))));
 
 builder.Services.AddSingleton<WebSearchService>();
+builder.Services.AddSingleton<StockWebSocketManager>();
+builder.Services.AddHostedService<StockPriceUpdateService>();
 
 builder.Services.AddSingleton<Kernel>(sp =>
 {
@@ -107,12 +109,32 @@ app.UseExceptionHandler(errorApp =>
     });
 });
 
+// Enable WebSocket support
+app.UseWebSockets(new WebSocketOptions
+{
+    KeepAliveInterval = TimeSpan.FromSeconds(30)
+});
+
 app.UseResponseCompression();
 app.UseCors("AllowWebApp");
 app.UseSwagger();
 app.UseSwaggerUI();
 
 app.MapHealthChecks("/health");
+
+// WebSocket endpoint for real-time stock prices
+app.Map("/ws/stock", async (HttpContext context, StockWebSocketManager manager, ILogger<Program> logger) =>
+{
+    if (context.WebSockets.IsWebSocketRequest)
+    {
+        using var webSocket = await context.WebSockets.AcceptWebSocketAsync();
+        await StockWebSocketHandler.HandleWebSocketConnection(webSocket, manager, logger);
+    }
+    else
+    {
+        context.Response.StatusCode = 400;
+    }
+});
 
 // Main analysis endpoint with enhanced multi-agent system
 app.MapPost("/api/v1/analyze", async (
@@ -223,6 +245,91 @@ app.MapGet("/api/v1/stock-data/{ticker}", async (
 .WithOpenApi()
 .Produces<StockData>(200);
 
+// WebSocket info endpoint
+app.MapGet("/api/v1/websocket/info", (StockWebSocketManager manager) =>
+{
+    var activeSubscriptions = manager.GetActiveSubscriptions().ToList();
+    return Results.Ok(new
+    {
+        endpoint = "/ws/stock",
+        activeSubscriptions = activeSubscriptions.Select(ticker => new
+        {
+            ticker,
+            subscribers = manager.GetSubscriberCount(ticker)
+        }),
+        totalSubscriptions = activeSubscriptions.Count,
+        protocol = new
+        {
+            subscribe = new { action = "subscribe", ticker = "AAPL" },
+            unsubscribe = new { action = "unsubscribe" },
+            ping = new { action = "ping" }
+        },
+        messageFormat = new
+        {
+            priceUpdate = new
+            {
+                type = "price_update",
+                ticker = "AAPL",
+                price = 150.25m,
+                change = 2.50m,
+                changePercent = 1.69m,
+                volume = 50000000,
+                timestamp = DateTime.UtcNow
+            }
+        }
+    });
+})
+.WithName("WebSocketInfo")
+.WithOpenApi();
+
+// Agents endpoint
+app.MapGet("/api/v1/agents", () =>
+{
+    var agents = new[]
+    {
+        new
+        {
+            Name = "Technical_Analyst",
+            Role = "Technical",
+            Description = "Analyzes price trends, momentum indicators (RSI, MACD, moving averages), volume patterns, support/resistance levels, and chart formations. Provides specific entry/exit signals based on technical data."
+        },
+        new
+        {
+            Name = "Fundamental_Analyst",
+            Role = "Fundamental",
+            Description = "Evaluates financial metrics, valuation ratios, earnings quality, growth rates, and business fundamentals. Assesses intrinsic value vs market price."
+        },
+        new
+        {
+            Name = "Sentiment_Analyst",
+            Role = "Sentiment",
+            Description = "Analyzes market sentiment from news, social media, analyst ratings, and investor behavior. Gauges bullish/bearish sentiment and contrarian indicators."
+        },
+        new
+        {
+            Name = "News_Analyst",
+            Role = "News",
+            Description = "Evaluates recent news, earnings reports, analyst upgrades/downgrades, and macroeconomic events. Assesses impact on stock price and sector trends."
+        },
+        new
+        {
+            Name = "Bull_Researcher",
+            Role = "Bull",
+            Description = "Reviews analyst reports and builds the strongest BULL case. Highlights growth catalysts, undervaluation, competitive advantages, and positive trends. Challenges bearish concerns with data."
+        },
+        new
+        {
+            Name = "Bear_Researcher",
+            Role = "Bear",
+            Description = "Reviews analyst reports and builds the strongest BEAR case. Identifies overvaluation, risks, competitive threats, and negative trends. Challenges bullish assumptions with data."
+        }
+    };
+
+    return Results.Ok(agents);
+})
+.WithName("GetAgents")
+.WithOpenApi();
+
 // System info endpoint
 app.MapGet("/api/v1/system-info", () =>
 {
@@ -239,7 +346,8 @@ app.MapGet("/api/v1/system-info", () =>
             "Kelly Criterion Position Sizing",
             "Real-time Market Data (EODHD)",
             "Optional Web Search (Bing)",
-            "Structured Communication Protocol"
+            "Structured Communication Protocol",
+            "WebSocket Real-time Price Updates"
         },
         Workflow = new[]
         {
