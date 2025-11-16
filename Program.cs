@@ -13,6 +13,9 @@ if (string.IsNullOrEmpty(openAiKey))
 
 builder.Services.AddMemoryCache();
 
+// Configure cache options
+builder.Services.Configure<CacheOptions>(builder.Configuration.GetSection("Cache"));
+
 builder.Services.AddHttpClient<IStockDataService, EodhdStockDataService>()
     .SetHandlerLifetime(TimeSpan.FromMinutes(5))
     .ConfigureHttpClient(client =>

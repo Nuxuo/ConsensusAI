@@ -1,5 +1,21 @@
 namespace ConsensusAI.Models;
 
+/// <summary>
+/// Configuration options for the analysis cache
+/// </summary>
+public class CacheOptions
+{
+    /// <summary>
+    /// Gets or sets the cache duration in minutes
+    /// </summary>
+    public int AnalysisCacheDurationMinutes { get; set; } = 10;
+
+    /// <summary>
+    /// Gets or sets whether the analysis cache is enabled
+    /// </summary>
+    public bool EnableAnalysisCache { get; set; } = true;
+}
+
 public record StockRequest(
     List<string> Tickers,
     AnalysisMode Mode = AnalysisMode.Evaluate,

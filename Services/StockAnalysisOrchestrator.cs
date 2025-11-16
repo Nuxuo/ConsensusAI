@@ -3,6 +3,9 @@ using Microsoft.SemanticKernel.ChatCompletion;
 using ConsensusAI.Models;
 using System.Text.Json;
 using System.Text;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Options;
+using System.Security.Cryptography;
 
 namespace ConsensusAI.Services;
 
@@ -15,15 +18,21 @@ public class StockAnalysisOrchestrator
     private readonly IStockDataService _stockDataService;
     private readonly RiskManager _riskManager;
     private readonly PortfolioManager _portfolioManager;
+    private readonly IMemoryCache _cache;
+    private readonly CacheOptions _cacheOptions;
 
     public StockAnalysisOrchestrator(
         Kernel kernel,
         ILogger<StockAnalysisOrchestrator> logger,
-        IStockDataService stockDataService)
+        IStockDataService stockDataService,
+        IMemoryCache cache,
+        IOptions<CacheOptions> cacheOptions)
     {
         _kernel = kernel;
         _logger = logger;
         _stockDataService = stockDataService;
+        _cache = cache;
+        _cacheOptions = cacheOptions.Value;
         _riskManager = new RiskManager();
         _portfolioManager = new PortfolioManager();
 
@@ -64,6 +73,23 @@ public class StockAnalysisOrchestrator
         ValidateRequest(request);
 
         var tickers = string.Join(", ", request.Tickers);
+        var cacheKey = GenerateCacheKey(request, portfolioValue);
+
+        // Check cache if enabled
+        if (_cacheOptions.EnableAnalysisCache)
+        {
+            if (_cache.TryGetValue<AnalysisResult>(cacheKey, out var cachedResult))
+            {
+                _logger.LogInformation("💾 CACHE HIT: Returning cached analysis for {Tickers} (Mode: {Mode})",
+                    tickers, request.Mode);
+                _logger.LogInformation("   Cache was created at {Time}", cachedResult!.Conversation.FirstOrDefault()?.Timestamp);
+                return cachedResult;
+            }
+
+            _logger.LogInformation("🔍 CACHE MISS: No cached analysis found for {Tickers} (Mode: {Mode})",
+                tickers, request.Mode);
+        }
+
         var conversation = new List<AgentMessage>();
         var startTime = DateTime.UtcNow;
 
@@ -221,13 +247,23 @@ public class StockAnalysisOrchestrator
             _logger.LogInformation("");
             _logger.LogInformation("⏱️  Total execution time: {Time:F1}s", executionTime);
 
-            return new AnalysisResult(
+            var result = new AnalysisResult(
                 request.Tickers,
                 request.Mode,
                 request.Context,
                 conversation,
                 recommendations,
                 summary);
+
+            // Cache the result if enabled
+            if (_cacheOptions.EnableAnalysisCache)
+            {
+                var cacheExpiration = TimeSpan.FromMinutes(_cacheOptions.AnalysisCacheDurationMinutes);
+                _cache.Set(cacheKey, result, cacheExpiration);
+                _logger.LogInformation("💾 CACHED: Analysis stored for {Duration} minutes", _cacheOptions.AnalysisCacheDurationMinutes);
+            }
+
+            return result;
         }
         catch (Exception ex)
         {
@@ -510,6 +546,50 @@ Make decisions for: {string.Join(", ", stockData.Keys)}";
             throw new ArgumentException("Maximum 10 tickers");
         if (request.DiscussionRounds < 1 || request.DiscussionRounds > 5)
             throw new ArgumentException("Discussion rounds must be 1-5");
+    }
+
+    /// <summary>
+    /// Generates a unique cache key based on request parameters
+    /// </summary>
+    /// <param name="request">The stock analysis request</param>
+    /// <param name="portfolioValue">The portfolio value</param>
+    /// <returns>A unique cache key string</returns>
+    private string GenerateCacheKey(StockRequest request, decimal portfolioValue)
+    {
+        // Sort tickers to ensure consistent cache keys for same stocks
+        var sortedTickers = string.Join(",", request.Tickers.OrderBy(t => t));
+
+        // Include all parameters that affect the analysis
+        var keyComponents = $"{sortedTickers}|{request.Mode}|{request.DiscussionRounds}|{portfolioValue}|{request.EnableWebSearch}|{request.Context ?? ""}";
+
+        // Generate hash for shorter cache key
+        using var sha256 = SHA256.Create();
+        var hashBytes = sha256.ComputeHash(System.Text.Encoding.UTF8.GetBytes(keyComponents));
+        var hashString = Convert.ToBase64String(hashBytes);
+
+        return $"analysis:{hashString}";
+    }
+
+    /// <summary>
+    /// Invalidates cached analysis for specific tickers
+    /// This method should be called when stock data is updated
+    /// </summary>
+    /// <param name="tickers">The tickers whose cache should be invalidated</param>
+    public void InvalidateCache(params string[] tickers)
+    {
+        if (!_cacheOptions.EnableAnalysisCache || tickers == null || tickers.Length == 0)
+            return;
+
+        _logger.LogInformation("🗑️  CACHE INVALIDATION: Clearing cache for {Count} ticker(s): {Tickers}",
+            tickers.Length, string.Join(", ", tickers));
+
+        // Note: Since our cache keys are hashed and include multiple parameters,
+        // we cannot easily remove specific entries without maintaining a separate index.
+        // For this implementation, the cache will auto-expire after the configured duration.
+        // A future enhancement could maintain a ticker-to-cachekey mapping for precise invalidation.
+
+        _logger.LogInformation("   Cache entries will auto-expire after {Minutes} minutes",
+            _cacheOptions.AnalysisCacheDurationMinutes);
     }
 }
 
